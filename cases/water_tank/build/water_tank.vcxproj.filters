@@ -1,0 +1,16 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <ClCompile Include="D:\SPH_soft\SPH_2D_GPU\SPHNJ\cases\water_tank\particle_generate.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <CustomBuild Include="D:\SPH_soft\SPH_2D_GPU\SPHNJ\cases\water_tank\CMakeLists.txt" />
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="Source Files">
+      <UniqueIdentifier>{7099D29C-2DFC-3C69-9EDA-9E8AE136D19F}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>

@@ -1,0 +1,1463 @@
+#include "calculation.cuh"
+#include "cuda_functions.cuh"
+#include "cuda_macro.cuh"
+#include "Eigen/Dense"
+
+#include <iostream>
+#include <string>
+#include <windows.h>
+
+__constant__ Parameter par;
+
+__device__ int findParticleBlock(const Eigen::Vector2f &pos, const Domain &domain)
+{
+    float xmin = domain.cell_xmin[0];
+    float ymin = domain.cell_xmin[1];
+    float inter_inv_x = domain.interval_inv[0];
+    float inter_inv_y = domain.interval_inv[1];
+    int block_nx = domain.block_number[0];
+    int block_ny = domain.block_number[1];
+
+    return (int)((pos[1] - ymin) * inter_inv_y) + (int)((pos[0] - xmin) * inter_inv_x) * block_ny;
+}
+
+__global__ void findFluidParticleBlock(Sim *sim, int *error_flag)
+{
+    int particle_id = blockIdx.x * blockDim.x + threadIdx.x;
+    Parameter *parameter = sim->parameter;
+    if (particle_id < parameter->fluid.number_total)
+    {
+        Fluid_Particle *fp = sim->fluid_particle;
+        fp[particle_id].block_id = findParticleBlock(fp[particle_id].position, parameter->domain);
+        if (fp[particle_id].block_id == -1)
+        {
+            printf("fluid particle (%f,%f) outside domain\n", fp[particle_id].position[0], fp[particle_id].position[1]);
+            *error_flag = 1;
+        }
+    }
+}
+
+__global__ void findSolidParticleBlock(Sim *sim, int *error_flag)
+{
+    int particle_id = blockIdx.x * blockDim.x + threadIdx.x;
+    Parameter *parameter = sim->parameter;
+    if (particle_id < parameter->solid.number)
+    {
+        Solid_Particle *sp = sim->solid_particle;
+        sp[particle_id].block_id = findParticleBlock(sp[particle_id].position, parameter->domain);
+        if (sp[particle_id].block_id == -1)
+        {
+            printf("solid particle (%f,%f) outside domain\n", sp[particle_id].position[0], sp[particle_id].position[1]);
+            *error_flag = 1;
+        }
+    }
+}
+
+__global__ void findVirtParticleBlock(Sim *sim, int *error_flag)
+{
+    int particle_id = blockIdx.x * blockDim.x + threadIdx.x;
+    Parameter *parameter = sim->parameter;
+    if (particle_id < parameter->virt.number)
+    {
+        Virtual_Particle *vp = sim->virtual_particle;
+        vp[particle_id].block_id = findParticleBlock(vp[particle_id].position, parameter->domain);
+        vp[particle_id].mirror_block_id = findParticleBlock(vp[particle_id].mirror_position, parameter->domain);
+        if (vp[particle_id].block_id == -1)
+        {
+            printf("solid particle (%f,%f) outside domain\n", vp[particle_id].position[0], vp[particle_id].position[1]);
+            *error_flag = 1;
+        }
+    }
+}
+
+__global__ void fillBlockParticleList(Sim *sim, int *error_flag)
+{
+    int block_id = blockIdx.x * blockDim.x + threadIdx.x;
+    Parameter *parameter = sim->parameter;
+    int block_num = parameter->domain.block_number_total;
+
+    if (block_id < block_num)
+    {
+        int block_size = parameter->kernel.block_size;
+        Block *block = sim->block;
+        int num(0);
+        Fluid_Particle *fp = sim->fluid_particle;
+        Solid_Particle *sp = sim->solid_particle;
+        Virtual_Particle *vp = sim->virtual_particle;
+
+        for (int i = 0; i < 9; i++)
+        {
+            int neighbor_id = block[block_id].neighbor_id(i);
+            if (neighbor_id != -1)
+            {
+                for (int j = 0; j < block_size; j++)
+                {
+                    int previous_id = block[neighbor_id].particle_list_previous[j].id;
+                    if (previous_id == -1)
+                        break;
+                    ParticleType previous_type = block[neighbor_id].particle_list_previous[j].particle_type;
+
+                    switch (previous_type)
+                    {
+                    case Fluid:
+                        if (fp[previous_id].block_id == block_id)
+                        {
+                            block[block_id].particle_list[num].id = previous_id;
+                            block[block_id].particle_list[num].particle_type = Fluid;
+                            num++;
+                        }
+                        break;
+                    case Solid:
+                        if (sp[previous_id].block_id == block_id)
+                        {
+                            block[block_id].particle_list[num].id = previous_id;
+                            block[block_id].particle_list[num].particle_type = Solid;
+                            num++;
+                        }
+                        break;
+                    case Virt:
+                        if (vp[previous_id].block_id == block_id)
+                        {
+                            block[block_id].particle_list[num].id = previous_id;
+                            block[block_id].particle_list[num].particle_type = Virt;
+                            num++;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        for (int j = num; j < block_size; j++)
+        {
+            block[block_id].particle_list[j].id = -1;
+            block[block_id].particle_list[j].particle_type = Fluid;
+        }
+        if (num > block_size)
+        {
+            printf("id = %d number = %d x(%f, %f) y(%f, %f)\n", block_id, num, block[block_id].xmin[0], block[block_id].xmax[0], block[block_id].xmin[1], block[block_id].xmax[1]);
+            *error_flag = 1;
+        }
+    }
+}
+
+__global__ void generateBlockParticleList(Sim *sim, int *error_flag)
+{
+    int block_id = blockIdx.x * blockDim.x + threadIdx.x;
+    Parameter *parameter = sim->parameter;
+    int block_num = parameter->domain.block_number_total;
+    if (block_id < block_num)
+    {
+        Block *block = sim->block;
+        Fluid_Particle *fp = sim->fluid_particle;
+        Solid_Particle *sp = sim->solid_particle;
+        Virtual_Particle *vp = sim->virtual_particle;
+
+        int fluid_num = parameter->fluid.number_total;
+        int solid_num = parameter->solid.number;
+        int virt_num = parameter->virt.number;
+
+        int num(0);
+        for (int i = 0; i < fluid_num; i++)
+        {
+            if (fp[i].block_id == block_id)
+            {
+                block[block_id].particle_list[num].id = i;
+                block[block_id].particle_list[num].particle_type = Fluid;
+                num++;
+            }
+        }
+        for (int i = 0; i < solid_num; i++)
+        {
+            if (sp[i].block_id == block_id)
+            {
+                block[block_id].particle_list[num].id = i;
+                block[block_id].particle_list[num].particle_type = Solid;
+                num++;
+            }
+        }
+
+        for (int i = 0; i < virt_num; i++)
+        {
+            if (vp[i].block_id == block_id)
+            {
+                block[block_id].particle_list[num].id = i;
+                block[block_id].particle_list[num].particle_type = Virt;
+                num++;
+            }
+        }
+        if (num > parameter->kernel.block_size)
+        {
+            printf("id = %d number = %f x(%f, %f) y(%f, %f)\n", block_id, num, block[block_id].xmin[0], block[block_id].xmax[0], block[block_id].xmin[1], block[block_id].xmax[1]);
+            *error_flag = 1;
+        }
+    }
+}
+
+__global__ void copyBlockList(Sim *sim, int *errorflag)
+{
+    int bid = blockIdx.x;
+    int tid = threadIdx.x;
+    Block *block = sim->block;
+    block[bid].particle_list_previous[tid] = block[bid].particle_list[tid];
+}
+
+__global__ void fillFluidPairList(Sim *sim, int *error_flag)
+{
+    int particle_id = blockIdx.x * blockDim.x + threadIdx.x;
+    Parameter *parameter = sim->parameter;
+    if (particle_id < parameter->fluid.number_total)
+    {
+        Fluid_Particle *fp = sim->fluid_particle;
+        Solid_Particle *sp = sim->solid_particle;
+        Virtual_Particle *vp = sim->virtual_particle;
+        Block *block = sim->block;
+
+        int num(0);
+        int pair_size = parameter->kernel.fluid_pair_size;
+        int block_size = parameter->kernel.block_size;
+        int block_id = fp[particle_id].block_id;
+
+        float hsml_2 = parameter->kernel.fluid_impact_distance_square;
+
+        Eigen::Vector2f pos_i = fp[particle_id].position;
+        Eigen::Vector2f pos_j;
+        for (int i = 0; i < 9; i++)
+        {
+            int neighbor_id = block[block_id].neighbor_id(i);
+            if (neighbor_id != -1)
+            {
+                for (int j = 0; j < block_size; j++)
+                {
+                    int id_j = block[neighbor_id].particle_list[j].id;
+                    if (id_j == -1)
+                        break;
+                    ParticleType type_j = block[neighbor_id].particle_list[j].particle_type;
+
+                    switch (type_j)
+                    {
+                    case Fluid:
+                        pos_j = fp[id_j].position;
+                        if ((pos_i - pos_j).squaredNorm() < hsml_2)
+                        {
+                            fp[particle_id].pair_list[num].id = id_j;
+                            fp[particle_id].pair_list[num].particle_type = Fluid;
+                            num++;
+                        }
+                        break;
+                    case Solid:
+                        pos_j = sp[id_j].position;
+                        if ((pos_i - pos_j).squaredNorm() < hsml_2)
+                        {
+                            fp[particle_id].pair_list[num].id = id_j;
+                            fp[particle_id].pair_list[num].particle_type = Solid;
+                            num++;
+                        }
+                        break;
+                    case Virt:
+                        pos_j = vp[id_j].position;
+                        if ((pos_i - pos_j).squaredNorm() < hsml_2)
+                        {
+                            fp[particle_id].pair_list[num].id = id_j;
+                            fp[particle_id].pair_list[num].particle_type = Virt;
+                            num++;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        for (int i = num; i < pair_size; i++)
+        {
+            fp[particle_id].pair_list[i].id = -1;
+            fp[particle_id].pair_list[i].particle_type = Fluid;
+        }
+        if (num > pair_size)
+        {
+            printf("id = %d type = %d number = %d x(%f, %f)\n", particle_id, 0, num, fp[particle_id].position[0], fp[particle_id].position[1]);
+            *error_flag = 1;
+        }
+    }
+}
+
+__global__ void fillSolidPairList(Sim *sim, int *error_flag)
+{
+    int particle_id = blockIdx.x * blockDim.x + threadIdx.x;
+    Parameter *parameter = sim->parameter;
+    if (particle_id < parameter->solid.number)
+    {
+        Fluid_Particle *fp = sim->fluid_particle;
+        Solid_Particle *sp = sim->solid_particle;
+        Virtual_Particle *vp = sim->virtual_particle;
+        Block *block = sim->block;
+
+        int num(0);
+        int pair_size = parameter->kernel.fluid_pair_size;
+        int block_size = parameter->kernel.block_size;
+        int block_id = sp[particle_id].block_id;
+
+        float hsml_2_fluid = parameter->kernel.fluid_impact_distance_square;
+        float hsml_2_solid = parameter->kernel.solid_impact_distance_square;
+
+        Eigen::Vector2f pos_i = sp[particle_id].position;
+        Eigen::Vector2f pos_j;
+        for (int i = 0; i < 9; i++)
+        {
+            int neighbor_id = block[block_id].neighbor_id(i);
+            if (neighbor_id != -1)
+            {
+                for (int j = 0; j < block_size; j++)
+                {
+                    int id_j = block[neighbor_id].particle_list[j].id;
+                    if (id_j == -1)
+                        break;
+                    ParticleType type_j = block[neighbor_id].particle_list[j].particle_type;
+
+                    switch (type_j)
+                    {
+                    case Fluid:
+                        pos_j = fp[id_j].position;
+                        if ((pos_i - pos_j).squaredNorm() < hsml_2_fluid)
+                        {
+                            sp[particle_id].pair_list[num].id = id_j;
+                            sp[particle_id].pair_list[num].particle_type = Fluid;
+                            num++;
+                        }
+                        break;
+                    case Solid:
+                        pos_j = sp[id_j].position;
+                        if ((pos_i - pos_j).squaredNorm() < hsml_2_solid)
+                        {
+                            sp[particle_id].pair_list[num].id = id_j;
+                            sp[particle_id].pair_list[num].particle_type = Solid;
+                            num++;
+                        }
+                        break;
+                    case Virt:
+                        pos_j = vp[id_j].position;
+                        if ((pos_i - pos_j).squaredNorm() < hsml_2_fluid)
+                        {
+                            sp[particle_id].pair_list[num].id = id_j;
+                            sp[particle_id].pair_list[num].particle_type = Virt;
+                            num++;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        for (int i = num; i < pair_size; i++)
+        {
+            sp[particle_id].pair_list[i].id = -1;
+            sp[particle_id].pair_list[i].particle_type = Fluid;
+        }
+        if (num > pair_size)
+        {
+            printf("id = %d type = %d number = %d x(%f, %f)\n", particle_id, 1, num, sp[particle_id].position[0], sp[particle_id].position[1]);
+            *error_flag = 1;
+        }
+    }
+}
+
+__global__ void fillVirtPairList(Sim *sim, int *error_flag)
+{
+    int particle_id = blockIdx.x * blockDim.x + threadIdx.x;
+    Parameter *parameter = sim->parameter;
+    if (particle_id < parameter->virt.number)
+    {
+        Fluid_Particle *fp = sim->fluid_particle;
+        Solid_Particle *sp = sim->solid_particle;
+        Virtual_Particle *vp = sim->virtual_particle;
+        Block *block = sim->block;
+
+        int num(0);
+        int pair_size = parameter->kernel.fluid_pair_size;
+        int block_size = parameter->kernel.block_size;
+        int block_id = vp[particle_id].mirror_block_id;
+
+        float hsml_2 = parameter->kernel.fluid_impact_distance_square;
+
+        Eigen::Vector2f pos_i = vp[particle_id].mirror_position;
+        Eigen::Vector2f pos_j;
+        for (int i = 0; i < 9; i++)
+        {
+            int neighbor_id = block[block_id].neighbor_id(i);
+            if (neighbor_id != -1)
+            {
+                for (int j = 0; j < block_size; j++)
+                {
+                    int id_j = block[neighbor_id].particle_list[j].id;
+                    if (id_j == -1)
+                        break;
+                    ParticleType type_j = block[neighbor_id].particle_list[j].particle_type;
+
+                    switch (type_j)
+                    {
+                    case Fluid:
+                        pos_j = fp[id_j].position;
+                        if ((pos_i - pos_j).squaredNorm() < hsml_2)
+                        {
+                            vp[particle_id].pair_list[num].id = id_j;
+                            vp[particle_id].pair_list[num].particle_type = Fluid;
+                            num++;
+                        }
+                        break;
+                    case Solid:
+                        pos_j = sp[id_j].position;
+                        if ((pos_i - pos_j).squaredNorm() < hsml_2)
+                        {
+                            vp[particle_id].pair_list[num].id = id_j;
+                            vp[particle_id].pair_list[num].particle_type = Solid;
+                            num++;
+                        }
+                        break;
+                    case Virt:
+                        pos_j = vp[id_j].position;
+                        if ((pos_i - pos_j).squaredNorm() < hsml_2)
+                        {
+                            vp[particle_id].pair_list[num].id = id_j;
+                            vp[particle_id].pair_list[num].particle_type = Virt;
+                            num++;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        for (int i = num; i < pair_size; i++)
+        {
+            vp[particle_id].pair_list[i].id = -1;
+            vp[particle_id].pair_list[i].particle_type = Fluid;
+        }
+        if (num > pair_size)
+        {
+            printf("id = %d type = %d number = %d x(%f, %f)\n", particle_id, 2, num, vp[particle_id].position[0], vp[particle_id].position[1]);
+            *error_flag = 1;
+        }
+    }
+}
+
+void fillParticlePair(Sim *sim, Sim *host_sim)
+{
+    int error_flag = 0;
+    Parameter *parameter = host_sim->parameter;
+    int thread_num = parameter->kernel.thread_num;
+    int fluid_num = parameter->fluid.number_total;
+    int solid_num = parameter->solid.number;
+    int virt_num = parameter->virt.number;
+    int particle_num = fluid_num + solid_num + virt_num;
+
+    if (fluid_num != 0)
+        findFluidParticleBlock<<<fluid_num / thread_num + 1, thread_num>>>(sim, &error_flag);
+    if (solid_num != 0)
+        findSolidParticleBlock<<<solid_num / thread_num + 1, thread_num>>>(sim, &error_flag);
+    if (virt_num != 0)
+        findVirtParticleBlock<<<virt_num / thread_num + 1, thread_num>>>(sim, &error_flag);
+    cudaDeviceSynchronize();
+    if (error_flag)
+        throw std::invalid_argument("PARTICLE OUTSIDE DOMAIN");
+
+    int block_num = parameter->domain.block_number_total;
+    SimTime *time = parameter->getTime();
+    if (time->isFirstStep())
+    {
+        generateBlockParticleList<<<block_num / thread_num + 1, thread_num>>>(sim, &error_flag);
+        printf("one\n");
+    }
+    else
+        fillBlockParticleList<<<block_num / thread_num + 1, thread_num>>>(sim, &error_flag);
+    cudaDeviceSynchronize();
+    if (error_flag)
+        throw std::invalid_argument("TOO MANY PARTICLES IN A BLOCK");
+
+    int block_size = parameter->kernel.block_size;
+    copyBlockList<<<block_num, block_size>>>(sim, &error_flag);
+    if (fluid_num != 0)
+        fillFluidPairList<<<fluid_num / thread_num + 1, thread_num>>>(sim, &error_flag);
+    if (solid_num != 0)
+        fillSolidPairList<<<solid_num / thread_num + 1, thread_num>>>(sim, &error_flag);
+    if (virt_num != 0)
+        fillVirtPairList<<<virt_num / thread_num + 1, thread_num>>>(sim, &error_flag);
+    cudaDeviceSynchronize();
+    if (error_flag)
+        throw std::invalid_argument("TOO MANY PAIRS FOR A PARTICLE");
+}
+
+__device__ float pressureToDensity(float &pressure, const PhaseType &phase, const Parameter *parameter)
+{
+    float density_reference = parameter->fluid.reference_density[phase];
+    if (phase == Gas)
+    {
+        float min_pressure = parameter->fluid.min_pressure_for_gas;
+        pressure = max(pressure, parameter->fluid.min_pressure_for_gas);
+    }
+    float coef = parameter->fluid.coefficient_p2rho[phase];
+    float gamma_inv = parameter->fluid.gamma_inv[phase];
+
+    return density_reference * __powf(__fmaf_rd(pressure, coef, 1.0f), gamma_inv);
+}
+
+__device__ float densityToPressure(float &density, const PhaseType &phase, const Parameter *parameter)
+{
+    float density_inverse = parameter->fluid.reference_density_inverse[phase];
+    float coef = parameter->fluid.coefficient_rho2p[phase];
+    float gamma = parameter->fluid.gamma[phase];
+
+    return (__powf(density * density_inverse, gamma) - 1.0f) * coef;
+}
+
+__global__ void virtPhaseCalculate(Sim *sim, int *error_flag)
+{
+    int particle_id = blockIdx.x;
+    int pair_id = threadIdx.x;
+
+    Parameter *parameter = sim->parameter;
+
+    Virtual_Particle *vp = sim->virtual_particle;
+    Fluid_Particle *fp = sim->fluid_particle;
+
+    int id_j = vp[particle_id].pair_list[pair_id].id;
+    ParticleType type_j = vp[particle_id].pair_list[pair_id].particle_type;
+
+    int pair_size = parameter->kernel.fluid_pair_size;
+
+    extern __shared__ float shared_memory[];
+    float *coef_sum = shared_memory;
+    float *mirror_pid = coef_sum + pair_size;
+
+    // virtual phase type
+    if (type_j == Fluid && id_j != -1)
+    {
+
+        float coef1 = parameter->kernel.kernel_coefficient_1;
+        float coef2 = parameter->kernel.kernel_coefficient_2;
+        float h_inv = parameter->kernel.fluid_smoothing_length_inverse;
+
+        float coef3to2 = parameter->kernel.coefficient_3d_to_2d;
+
+        float q = (vp[particle_id].mirror_position - fp[id_j].position).norm() * h_inv;
+        float kernel_coef = (__expf(-q * q) - coef1) * coef2 * coef3to2;
+
+        coef_sum[pair_id] = kernel_coef;
+
+        if (fp[id_j].fluid_phase_type == Gas)
+            mirror_pid[pair_id] = kernel_coef * 1.5f;
+        else if (fp[id_j].fluid_phase_type == Liquid)
+            mirror_pid[pair_id] = kernel_coef * 0.5f;
+    }
+    else
+    {
+        mirror_pid[pair_id] = 0.0f;
+        coef_sum[pair_id] = 0.0f;
+    }
+    __syncthreads();
+    //reduction(coef_sum, pair_id, pair_size);
+    //reduction(mirror_pid, pair_id, pair_size);
+    __syncthreads();
+    if (pair_id == 0)
+    {
+        if (coef_sum[0] != 0.0f)
+            coef_sum[0] = __frcp_rd(coef_sum[0]); // intrinsic for 1/x
+        else
+            coef_sum[0] = 0.0f;
+        vp[particle_id].virtual_phase_type = PhaseType(int(mirror_pid[0] * coef_sum[0]));
+        vp[particle_id].virtual_phase_type = Liquid;
+    }
+}
+
+// virtual mirror (velocity,pressure,pid)
+__global__ void virtDataCalculate(Sim *sim, int *error_flag)
+{
+    int particle_id = blockIdx.x;
+    int pair_id = threadIdx.x;
+
+    Parameter *parameter = sim->parameter;
+
+    Virtual_Particle *vp = sim->virtual_particle;
+    Fluid_Particle *fp = sim->fluid_particle;
+
+    int id_j = vp[particle_id].pair_list[pair_id].id;
+    ParticleType type_j = vp[particle_id].pair_list[pair_id].particle_type;
+
+    int pair_size = parameter->kernel.fluid_pair_size;
+
+    extern __shared__ float shared_memory[];
+    float *coef_sum = shared_memory;
+    float *mirror_pressure = coef_sum + pair_size;
+    Eigen::Vector2f *mirror_velocity = (Eigen::Vector2f *)(mirror_pressure + pair_size);
+
+    //
+    if (id_j != -1)
+    {
+        switch (type_j)
+        {
+        case Fluid:
+            if (vp[particle_id].virtual_phase_type == fp[id_j].fluid_phase_type || 1)
+            {
+                float coef1 = parameter->kernel.kernel_coefficient_1;
+                float coef2 = parameter->kernel.kernel_coefficient_2;
+                float h_inv = parameter->kernel.fluid_smoothing_length_inverse;
+                float vol = parameter->kernel.fluid_particle_volume;
+
+                float coef3to2 = parameter->kernel.coefficient_3d_to_2d;
+
+                float q = (vp[particle_id].mirror_position - fp[id_j].position).norm() * h_inv;
+                float kernel_coef = (__expf(-q * q) - coef1) * coef2 * coef3to2;
+
+                coef_sum[pair_id] = kernel_coef;
+
+                mirror_velocity[pair_id] = kernel_coef * fp[id_j].velocity;
+                mirror_pressure[pair_id] = kernel_coef * fp[id_j].pressure;
+            }
+            else
+            {
+                coef_sum[pair_id] = 0.0f;
+                mirror_velocity[pair_id] = Eigen::Vector2f::Zero();
+                mirror_pressure[pair_id] = 0.0f;
+            }
+            break;
+        case Solid:
+            coef_sum[pair_id] = 0.0f;
+            mirror_velocity[pair_id] = Eigen::Vector2f::Zero();
+            mirror_pressure[pair_id] = 0.0f;
+            break;
+        case Virt:
+            if (vp[particle_id].virtual_phase_type == vp[id_j].virtual_phase_type || 1)
+            {
+                float coef1 = parameter->kernel.kernel_coefficient_1;
+                float coef2 = parameter->kernel.kernel_coefficient_2;
+                float h_inv = parameter->kernel.fluid_smoothing_length_inverse;
+                float vol = parameter->kernel.fluid_particle_volume;
+
+                float coef3to2 = parameter->kernel.coefficient_3d_to_2d;
+
+                float q = (vp[particle_id].mirror_position - fp[id_j].position).norm() * h_inv;
+                float kernel_coef = (__expf(-q * q) - coef1) * coef2 * coef3to2;
+
+                coef_sum[pair_id] = kernel_coef;
+
+                mirror_velocity[pair_id] = kernel_coef * vp[id_j].velocity_previous;
+                mirror_pressure[pair_id] = kernel_coef * vp[id_j].pressure_previous;
+            }
+            else
+            {
+                coef_sum[pair_id] = 0.0f;
+                mirror_velocity[pair_id] = Eigen::Vector2f::Zero();
+                mirror_pressure[pair_id] = 0.0f;
+            }
+            break;
+        }
+    }
+    else
+    {
+        coef_sum[pair_id] = 0.0f;
+        mirror_velocity[pair_id] = Eigen::Vector2f::Zero();
+        mirror_pressure[pair_id] = 0.0f;
+    }
+    __syncthreads();
+    //reduction(coef_sum, pair_id, pair_size);
+    if (pair_id == 0)
+    {
+        coef_sum[0] = __frcp_rd(coef_sum[0]); // intrinsic for 1/x
+        if (!(coef_sum[0] == coef_sum[0]))
+        {
+            printf("virtual particle illegal kernel coefficient id=%d coef=%f\n", particle_id, coef_sum[0]);
+            *error_flag = 1;
+        }
+    }
+    __syncthreads();
+    //reduction(mirror_velocity, pair_id, pair_size);
+    if (pair_id == 0)
+    {
+        Eigen::Vector2f fluid_velo = mirror_velocity[0] * coef_sum[0];
+        float project_velo = fluid_velo.dot(vp[particle_id].normal);
+        vp[particle_id].velocity = fluid_velo - 2.0f * project_velo * vp[particle_id].normal;
+        if (!(mirror_velocity[0] == mirror_velocity[0]))
+        {
+            printf("virtual particle illegal velocity id=%d v=%f %f\n", particle_id, vp[particle_id].velocity[0], vp[particle_id].velocity[1]);
+            *error_flag = 1;
+        }
+    }
+    //reduction(mirror_pressure, pair_id, pair_size);
+    if (pair_id == 0)
+    {
+        vp[particle_id].pressure = mirror_pressure[0] * coef_sum[0];
+        if (!(vp[particle_id].pressure == vp[particle_id].pressure))
+        {
+            printf("virtual particle illegal pressure id=%d p=%f\n", particle_id, vp[particle_id].pressure);
+            *error_flag = 1;
+        }
+    }
+    __syncthreads();
+    if (pair_id == 0)
+    {
+        Eigen::Vector2f gravity = Eigen::Vector2f(parameter->physics.gravity[0], parameter->physics.gravity[0]);
+        vp[particle_id].density = pressureToDensity(vp[particle_id].pressure, vp[particle_id].virtual_phase_type, parameter);
+        vp[particle_id].pressure += vp[particle_id].density * (vp[particle_id].position - vp[particle_id].mirror_position).dot(gravity);
+        vp[particle_id].density = pressureToDensity(vp[particle_id].pressure, vp[particle_id].virtual_phase_type, parameter);
+    }
+}
+
+__global__ void virtDataUpdate(Sim *sim, int *error_flag)
+{
+    int particle_id = blockIdx.x * blockDim.x + threadIdx.x;
+    Parameter *parameter = sim->parameter;
+    Virtual_Particle *vp = sim->virtual_particle;
+    if (particle_id < parameter->virt.number)
+    {
+        PhaseType phase = vp[particle_id].virtual_phase_type;
+        vp[particle_id].velocity_previous = vp[particle_id].velocity;
+        vp[particle_id].pressure_previous = vp[particle_id].pressure;
+    }
+}
+
+__device__ Eigen::Vector2f shiftDisplacementCalculate(Sim *sim, int fluid_id)
+{
+    Fluid_Particle *fp = sim->fluid_particle;
+    if (fp[fluid_id].color < 1.8)
+        return Eigen::Vector2f::Zero();
+    Parameter *parameter = sim->parameter;
+    float coef = parameter->fluid.particle_shift_coef;
+    float diameter_2 = parameter->kernel.fluid_diameter_square;
+    return -coef * diameter_2 * fp[fluid_id].gradient;
+}
+__global__ void fluidDataUpdate(Sim *sim, int *error_flag)
+{
+    int particle_id = blockIdx.x * blockDim.x + threadIdx.x;
+    Parameter *parameter = sim->parameter;
+    Fluid_Particle *fp = sim->fluid_particle;
+    if (particle_id < parameter->fluid.number_total)
+    {
+        PhaseType phase = fp[particle_id].fluid_phase_type;
+        Eigen::Vector2f gravity = Eigen::Vector2f(parameter->physics.gravity[0], parameter->physics.gravity[1]);
+        Eigen::Vector2f xmin = Eigen::Vector2f(parameter->domain.domain_xmin[0], parameter->domain.domain_xmin[1]);
+        Eigen::Vector2f xmax = Eigen::Vector2f(parameter->domain.domain_xmax[0], parameter->domain.domain_xmax[1]);
+        float dt = parameter->time.dt;
+        fp[particle_id].position += fp[particle_id].velocity * dt;
+        fp[particle_id].velocity += (fp[particle_id].correction * fp[particle_id].du_dt + gravity) * dt;
+        fp[particle_id].density += fp[particle_id].drho_dt * dt;
+        fp[particle_id].pressure = densityToPressure(fp[particle_id].density, phase, parameter);
+
+        // Eigen::Vector2f shift_displacement = shiftDisplacementCalculate(sim, particle_id);
+        // fp[particle_id].position += shift_displacement;
+        // fp[particle_id].velocity += fp[particle_id].dudx * shift_displacement;
+
+        // saturate
+        fp[particle_id].position[0] = max(fp[particle_id].position[0], xmin[0]);
+        fp[particle_id].position[0] = min(fp[particle_id].position[0], xmax[0]);
+        fp[particle_id].position[1] = max(fp[particle_id].position[1], xmin[1]);
+        fp[particle_id].position[1] = min(fp[particle_id].position[1], xmax[1]);
+    }
+}
+__global__ void fluidDataCorrection(Sim *sim, int *error_flag)
+{
+    int particle_id = blockIdx.x;
+    int pair_id = threadIdx.x;
+
+    Parameter *parameter = sim->parameter;
+
+    Fluid_Particle *fp = sim->fluid_particle;
+    Solid_Particle *sp = sim->solid_particle;
+    Virtual_Particle *vp = sim->virtual_particle;
+
+    int id_j = fp[particle_id].pair_list[pair_id].id;
+    ParticleType type_j = fp[particle_id].pair_list[pair_id].particle_type;
+
+    int pair_size = parameter->kernel.fluid_pair_size;
+
+    extern __shared__ float shared_memory[];
+
+    float *color = (float *)shared_memory;
+    Eigen::Vector2f *gradient = (Eigen::Vector2f *)(color + pair_size);
+    Eigen::Matrix2f *dudx = (Eigen::Matrix2f *)(gradient + pair_size);
+
+    if (id_j != -1)
+    {
+        float coef_fluid = parameter->kernel.kernel_differential_fluid;
+        float coef_solid = parameter->kernel.kernel_differential_solid;
+        float h_inv_fluid = parameter->kernel.fluid_smoothing_length_inverse;
+        float h_inv_solid = parameter->kernel.solid_smoothing_length_inverse;
+
+        float coef3to2 = parameter->kernel.coefficient_3d_to_2d;
+
+        if (type_j == Fluid)
+        {
+            Eigen::Vector2f dx = fp[id_j].position - fp[particle_id].position;
+            Eigen::Vector2f du = fp[id_j].velocity - fp[particle_id].velocity;
+            float dis = dx.norm();
+            float q = dis * h_inv_fluid;
+            float kernel_coef = __expf(-q * q) * coef_fluid * coef3to2;
+
+            PhaseType phase_i = fp[particle_id].fluid_phase_type;
+            PhaseType phase_j = fp[id_j].fluid_phase_type;
+
+            gradient[pair_id] = dx * kernel_coef;
+            dudx[pair_id] = du * dx.transpose() * kernel_coef;
+            if (!(phase_i == Liquid && phase_j == Gas))
+                color[pair_id] = dx.dot(dx) * kernel_coef;
+            else
+                color[pair_id] = 0.0f;
+        }
+        else if (type_j == Solid)
+        {
+            Eigen::Vector2f dx = sp[id_j].position - fp[particle_id].position;
+            Eigen::Vector2f du = sp[id_j].virtual_velocity - fp[particle_id].velocity;
+            float dis = dx.norm();
+            float q = dis * h_inv_solid;
+            float kernel_coef = __expf(-q * q) * coef_solid * coef3to2;
+
+            gradient[pair_id].setZero();
+            color[pair_id] = 0.0f;
+            dudx[pair_id] = du * dx.transpose() * kernel_coef;
+        }
+        else if (type_j == Virt)
+        {
+            Eigen::Vector2f dx = vp[id_j].position - fp[particle_id].position;
+            Eigen::Vector2f du = -2.0f * fp[particle_id].velocity.dot(vp[id_j].normal) * vp[id_j].normal;
+            float dis = dx.norm();
+            float q = dis * h_inv_fluid;
+            float kernel_coef = __expf(-q * q) * coef_fluid * coef3to2;
+
+            PhaseType phase_i = fp[particle_id].fluid_phase_type;
+            PhaseType phase_j = vp[id_j].virtual_phase_type;
+
+            gradient[pair_id] = dx * kernel_coef;
+            dudx[pair_id] = du * dx.transpose() * kernel_coef;
+            if (!(phase_i == Liquid && phase_j == Gas))
+                color[pair_id] = dx.dot(dx) * kernel_coef;
+            else
+                color[pair_id] = 0.0f;
+        }
+    }
+    else
+    {
+        gradient[pair_id].setZero();
+        dudx[pair_id].setZero();
+        color[pair_id] = 0.0f;
+    }
+    __syncthreads();
+    //reduction(color, pair_id, pair_size);
+    //reduction(gradient, pair_id, pair_size);
+    //reduction(dudx, pair_id, pair_size);
+    __syncthreads();
+    if (pair_id == 0)
+    {
+        fp[particle_id].color = color[0];
+        fp[particle_id].gradient = gradient[0];
+        fp[particle_id].dudx = dudx[0];
+    }
+}
+
+__global__ void fluidDataCalculate_fast(Sim *sim, int *error_flag)
+{
+    int particle_id = blockIdx.x * blockDim.x + threadIdx.x;
+    if (particle_id < sim->parameter->fluid.number_total)
+    {
+        // Fluid_Particle *fp = par.fluid_particle;
+        // Solid_Particle *sp = par.solid_particle;
+        // Virtual_Particle *vp = par.virtual_particle;
+
+        Fluid_Particle *fp = sim->fluid_particle;
+        Solid_Particle *sp = sim->solid_particle;
+        Virtual_Particle *vp = sim->virtual_particle;
+
+        float coef_fluid = par.kernel.kernel_differential_fluid;
+        float coef_solid = par.kernel.kernel_differential_solid;
+        float h_inv_fluid_2 = par.kernel.fluid_smoothing_length_inverse;
+        float h_inv_solid_2 = par.kernel.solid_smoothing_length_inverse;
+        float coef3to2 = par.kernel.coefficient_3d_to_2d;
+
+        Particle *p;
+
+        float velo_div(0.0f), color(0.0f);
+        Eigen::Vector2f gradient = Eigen::Vector2f::Zero();
+        Eigen::Vector2f force = Eigen::Vector2f::Zero();
+        Eigen::Matrix2f correction = Eigen::Matrix2f::Zero();
+        Eigen::Matrix2f dudx = Eigen::Matrix2f::Zero();
+
+        for (int pair_id = 0; pair_id < 64; pair_id++)
+        {
+            int id_j = fp[particle_id].pair_list[pair_id].id;
+            if (id_j == -1)
+                break;
+            ParticleType type_j = fp[particle_id].pair_list[pair_id].particle_type;
+
+            switch (type_j)
+            {
+            case Fluid:
+                p = fp + id_j;
+                break;
+            case Solid:
+                p = sp + id_j;
+                break;
+            case Virt:
+                p = vp + id_j;
+                break;
+            }
+            Eigen::Vector2f dx = p->position - fp[particle_id].position;
+            float dis_2 = dx.squaredNorm();
+            float q_2 = dis_2 * h_inv_fluid_2;
+            float kernel_coef = __expf(-q_2) * coef_fluid * coef3to2;
+
+            Eigen::Vector2f u_i = fp[particle_id].velocity;
+            Eigen::Vector2f u_j;
+            if (type_j == Solid)
+                u_j = sp[id_j].virtual_velocity;
+            else
+                u_j = p->velocity;
+
+            float rho_i = fp[particle_id].density;
+            float rho_j = p->density;
+            // float rho_j = pressureToDensity(p_j, phase, parameter);
+            float p_i = fp[particle_id].pressure;
+            float p_j = p->pressure;
+            // float cs = par.fluid.sound_speed[fp[particle_id].fluid_phase_type];
+            float cs = 20.0f;
+
+            float ps = __fdividef(rho_i * p_j + rho_j * p_i, rho_i + rho_j);
+
+            float du = (u_i - u_j).dot(dx.normalized());
+            if (du >= 0.0)
+                ps += rho_i * rho_j * __fdividef(du, rho_i + rho_j) * min(3.0f * du, cs);
+            force += -2.0f * __fdividef(ps, rho_i) * dx * kernel_coef;
+
+            Eigen::Vector2f vs = (rho_i * u_i + rho_j * u_j) * __fdividef(1.0f, rho_i + rho_j);
+            vs += __fdividef(p_i - p_j, (rho_i + rho_j) * cs) * dx.normalized();
+
+            //
+            velo_div += 2.0f * rho_i * (u_i - vs).dot(dx) * kernel_coef;
+            correction += dx * dx.transpose() * kernel_coef;
+            gradient += dx * kernel_coef;
+            dudx += (u_j - u_i) * dx.transpose() * kernel_coef;
+
+            if (type_j == Fluid)
+            {
+                PhaseType phase_i = fp[particle_id].fluid_phase_type;
+                PhaseType phase_j = fp[id_j].fluid_phase_type;
+                if (!(phase_i == Liquid && phase_j == Gas))
+                    color += dx.dot(dx) * kernel_coef;
+            }
+            else if (type_j == Virt)
+            {
+
+                PhaseType phase_i = fp[particle_id].fluid_phase_type;
+                PhaseType phase_j = vp[id_j].virtual_phase_type;
+                if (!(phase_i == Liquid && phase_j == Gas))
+                    color += dx.dot(dx) * kernel_coef;
+            }
+        }
+        fp[particle_id].du_dt = force;
+        fp[particle_id].drho_dt = velo_div;
+        fp[particle_id].correction = correction;
+        fp[particle_id].dudx = dudx;
+        fp[particle_id].gradient = gradient;
+        fp[particle_id].color = color;
+    }
+    __syncthreads();
+}
+__global__ void fluidDataCalculate(Sim *sihm, int *error_flag)
+{
+    // int particle_id = blockIdx.x;
+    // int pair_id = threadIdx.x;
+    // Fluid_Particle *fp = par.fluid_particle;
+    // Solid_Particle *sp = par.solid_particle;
+    // Virtual_Particle *vp = par.virtual_particle;
+
+    // int id_j = fp[particle_id].pair_list[pair_id].id;
+    // ParticleType type_j = fp[particle_id].pair_list[pair_id].particle_type;
+
+    // int pair_size = par.fluid_pair_size;
+
+    // float pp = fp[particle_id].pressure;
+    // extern __shared__ float shared_memory[];
+    // Eigen::Matrix2f *correction = (Eigen::Matrix2f *)shared_memory;
+    // Eigen::Vector2f *force = (Eigen::Vector2f *)(correction + pair_size);
+    // float *velo_div = (float *)(force + pair_size);
+
+    // float *color = (float *)(velo_div + pair_size);
+    // Eigen::Vector2f *gradient = (Eigen::Vector2f *)(color + pair_size);
+    // Eigen::Matrix2f *dudx = (Eigen::Matrix2f *)(gradient + pair_size);
+
+    // if (id_j != -1)
+    // {
+    //     float coef_fluid = par.kernel_differential_fluid;
+    //     float coef_solid = par.kernel_differential_solid;
+    //     float h_inv_fluid = par.fluid_smoothing_length_inverse;
+    //     float h_inv_solid = par.solid_smoothing_length_inverse;
+
+    //     float coef3to2 = par.coefficient_3d_to_2d;
+
+    //     if (type_j == Fluid)
+    //     {
+    //         Eigen::Vector2f dx = fp[id_j].position - fp[particle_id].position;
+    //         float dis = dx.norm();
+    //         float q = dis * h_inv_fluid;
+    //         float kernel_coef = __expf(-q * q) * coef_fluid * coef3to2;
+
+    //         Eigen::Vector2f u_i = fp[particle_id].velocity;
+    //         Eigen::Vector2f u_j = fp[id_j].velocity;
+
+    //         float rho_i = fp[particle_id].density;
+    //         float rho_j = fp[id_j].density;
+    //         float p_i = fp[particle_id].pressure;
+    //         float p_j = fp[id_j].pressure;
+    //         // float cs = par.fluid.sound_speed[fp[particle_id].fluid_phase_type];
+    //         float cs = 20.0f;
+
+    //         float ps = __fdividef(rho_i * p_j + rho_j * p_i, rho_i + rho_j);
+
+    //         float du = (u_i - u_j).dot(dx.normalized());
+    //         if (du >= 0.0)
+    //             ps += rho_i * rho_j * __fdividef(du, rho_i + rho_j) * min(3.0f * du, cs);
+    //         force[pair_id] = -2.0f * __fdividef(ps, rho_i) * dx * kernel_coef;
+
+    //         Eigen::Vector2f vs = (rho_i * u_i + rho_j * u_j) * __fdividef(1.0f, rho_i + rho_j);
+    //         vs += __fdividef(p_i - p_j, (rho_i + rho_j) * cs) * dx.normalized();
+
+    //         //
+    //         velo_div[pair_id] = 2.0f * rho_i * (u_i - vs).dot(dx) * kernel_coef;
+    //         correction[pair_id] = dx * dx.transpose() * kernel_coef;
+
+    //         PhaseType phase_i = fp[particle_id].fluid_phase_type;
+    //         PhaseType phase_j = fp[id_j].fluid_phase_type;
+
+    //         gradient[pair_id] = dx * kernel_coef;
+    //         dudx[pair_id] = (u_j - u_i) * dx.transpose() * kernel_coef;
+    //         if (!(phase_i == Liquid && phase_j == Gas))
+    //             color[pair_id] = dx.dot(dx) * kernel_coef;
+    //         else
+    //             color[pair_id] = 0.0f;
+    //     }
+    //     else if (type_j == Solid)
+    //     {
+    //         Eigen::Vector2f dx = sp[id_j].position - fp[particle_id].position;
+    //         float dis = dx.norm();
+    //         float q = dis * h_inv_fluid;
+    //         float kernel_coef = __expf(-q * q) * coef_solid * coef3to2;
+
+    //         Eigen::Vector2f u_i = fp[particle_id].velocity;
+    //         Eigen::Vector2f u_j = sp[id_j].virtual_velocity;
+
+    //         PhaseType phase = fp[particle_id].fluid_phase_type;
+    //         float p_i = fp[particle_id].pressure;
+    //         float p_j = sp[id_j].pressure;
+    //         float rho_i = fp[particle_id].density;
+    //         // float rho_j = pressureToDensity(p_j, phase, parameter);
+    //         // float cs = par.fluid.sound_speed[phase];
+    //         float rho_j = 1.0f;
+    //         float cs = 200.0f;
+
+    //         float ps = __fdividef(rho_i * p_j + rho_j * p_i, rho_i + rho_j);
+    //         float du = (u_i - u_j).dot(dx.normalized());
+    //         if (du >= 0.0)
+    //             ps += rho_i * rho_j * __fdividef(du, rho_i + rho_j) * min(3.0f * du, cs);
+    //         force[pair_id] = -2.0f * __fdividef(ps, rho_i) * dx * kernel_coef;
+
+    //         Eigen::Vector2f vs = (rho_i * u_i + rho_j * u_j) * __fdividef(1.0f, rho_i + rho_j);
+    //         vs += __fdividef(p_i - p_j, (rho_i + rho_j) * cs) * dx.normalized();
+    //         velo_div[pair_id] = 2.0f * rho_i * (u_i - vs).dot(dx) * kernel_coef;
+    //         correction[pair_id] = dx * dx.transpose() * kernel_coef;
+
+    //         gradient[pair_id] = dx * kernel_coef;
+    //         dudx[pair_id] = (u_j - u_i) * dx.transpose() * kernel_coef;
+    //         color[pair_id] = 0.0f;
+    //     }
+    //     else if (type_j == Virt)
+    //     {
+    //         Eigen::Vector2f dx = vp[id_j].position - fp[particle_id].position;
+    //         float dis = dx.norm();
+    //         float q = dis * h_inv_fluid;
+    //         float kernel_coef = __expf(-q * q) * coef_fluid * coef3to2;
+
+    //         Eigen::Vector2f u_i = fp[particle_id].velocity;
+    //         Eigen::Vector2f u_j = vp[id_j].velocity;
+
+    //         float rho_i = fp[particle_id].density;
+    //         float rho_j = vp[id_j].density;
+    //         float p_i = fp[particle_id].pressure;
+    //         float p_j = vp[id_j].pressure;
+    //         // float cs = par.fluid.sound_speed[fp[particle_id].fluid_phase_type];
+    //         float cs = 20.0f;
+
+    //         float project_velo = u_i.dot(vp[id_j].normal);
+    //         u_j = u_i - 2.0f * project_velo * vp[id_j].normal;
+    //         // u_j = u_i;
+    //         rho_j = rho_i;
+    //         Eigen::Vector2f gravity = Eigen::Vector2f(par.gravity[0], par.gravity[1]);
+    //         p_j = p_i + rho_i * gravity.dot(dx);
+
+    //         float ps = __fdividef(rho_i * p_j + rho_j * p_i, rho_i + rho_j);
+
+    //         float du = (u_i - u_j).dot(dx.normalized());
+    //         if (du >= 0.0)
+    //             ps += rho_i * rho_j * __fdividef(du, rho_i + rho_j) * min(3.0f * du, cs);
+    //         force[pair_id] = -2.0f * __fdividef(ps, rho_i) * dx * kernel_coef;
+
+    //         Eigen::Vector2f vs = (rho_i * u_i + rho_j * u_j) * __fdividef(1.0f, rho_i + rho_j);
+    //         vs += __fdividef(p_i - p_j, (rho_i + rho_j) * cs) * dx.normalized();
+    //         velo_div[pair_id] = 2.0f * rho_i * (u_i - vs).dot(dx) * kernel_coef;
+    //         correction[pair_id] = dx * dx.transpose() * kernel_coef;
+
+    //         PhaseType phase_i = fp[particle_id].fluid_phase_type;
+    //         PhaseType phase_j = vp[id_j].virtual_phase_type;
+
+    //         gradient[pair_id] = dx * kernel_coef;
+    //         dudx[pair_id] = (u_j - u_i) * dx.transpose() * kernel_coef;
+    //         if (!(phase_i == Liquid && phase_j == Gas))
+    //             color[pair_id] = dx.dot(dx) * kernel_coef;
+    //         else
+    //             color[pair_id] = 0.0f;
+    //     }
+    // }
+    // else
+    // {
+    //     force[pair_id].setZero();
+    //     velo_div[pair_id] = 0.0f;
+    //     correction[pair_id].setZero();
+    //     gradient[pair_id].setZero();
+    //     dudx[pair_id].setZero();
+    //     color[pair_id] = 0.0f;
+    // }
+
+    // __syncthreads();
+    // reduction(correction, pair_id, pair_size);
+    // reduction(force, pair_id, pair_size);
+    // reduction(velo_div, pair_id, pair_size);
+    // reduction(dudx, pair_id, pair_size);
+    // reduction(gradient, pair_id, pair_size);
+    // reduction(color, pair_id, pair_size);
+    // __syncthreads();
+    // if (pair_id == 0)
+    // {
+    //     fp[particle_id].du_dt = force[0];
+    //     fp[particle_id].drho_dt = velo_div[0];
+    //     fp[particle_id].correction = correction[0];
+    //     fp[particle_id].dudx = dudx[0];
+    //     fp[particle_id].gradient = gradient[0];
+    //     fp[particle_id].color = color[0];
+    // }
+}
+
+void memoryCopyDevice2Host(Sim *sim, Sim *host_sim)
+{
+    Parameter *parameter = host_sim->parameter;
+    int fluid_num = parameter->fluid.number_total;
+    int solid_num = parameter->solid.number;
+    int virt_num = parameter->virt.number;
+
+    std::cout << "Copying data to host" << std::endl;
+    Sim *temp_sim = new Sim;
+    CHECK(cudaMemcpy(temp_sim, sim, sizeof(Sim), cudaMemcpyDeviceToHost));
+    if (fluid_num != 0)
+        CHECK(cudaMemcpy(host_sim->fluid_particle, temp_sim->fluid_particle, fluid_num * sizeof(Fluid_Particle), cudaMemcpyDeviceToHost));
+    if (solid_num != 0)
+        CHECK(cudaMemcpy(host_sim->solid_particle, temp_sim->solid_particle, solid_num * sizeof(Solid_Particle), cudaMemcpyDeviceToHost));
+    if (virt_num != 0)
+        CHECK(cudaMemcpy(host_sim->virtual_particle, temp_sim->virtual_particle, virt_num * sizeof(Virtual_Particle), cudaMemcpyDeviceToHost));
+    delete temp_sim;
+}
+
+void writeFluidVelocity(Sim *sim, const std::string &path, SimTime *time)
+{
+    int fluid_num = sim->parameter->fluid.number_total;
+    Fluid_Particle *fp = sim->fluid_particle;
+
+    std::fstream output;
+    output.open(path + "\\fluid_velocity-" + std::to_string(time->file_step) + ".vtk", std::ios::out);
+
+    output << "# vtk DataFile Version 2.0" << std::endl;
+    output << "Velocity vector file" << std::endl;
+    output << "ASCII" << std::endl;
+    output << "DATASET POLYDATA" << std::endl;
+    output << "POINTS " << fluid_num << " float" << std::endl;
+    for (int i = 0; i < fluid_num; i++)
+        output << fp[i].position[0] << " " << fp[i].position[1] << " 0.0" << std::endl;
+    output << "POINT_DATA " << fluid_num << std::endl;
+    output << "VECTORS velocity float " << std::endl;
+    for (int i = 0; i < fluid_num; i++)
+        output << fp[i].velocity[0] << " " << fp[i].velocity[1] << " 0.0" << std::endl;
+    output.close();
+}
+
+void writeFluidDensity(Sim *sim, const std::string &path, SimTime *time)
+{
+    int fluid_num = sim->parameter->fluid.number_total;
+    Fluid_Particle *fp = sim->fluid_particle;
+
+    std::fstream output;
+    output.open(path + "\\fluid_density-" + std::to_string(time->file_step) + ".vtk", std::ios::out);
+
+    output << "# vtk DataFile Version 2.0" << std::endl;
+    output << "scalar file" << std::endl;
+    output << "ASCII" << std::endl;
+    output << "DATASET POLYDATA" << std::endl;
+    output << "POINTS " << fluid_num << " float" << std::endl;
+    for (int i = 0; i < fluid_num; i++)
+        output << fp[i].position[0] << " " << fp[i].position[1] << " 0.0" << std::endl;
+    output << "POINT_DATA " << fluid_num << std::endl;
+    output << "SCALARS density float 1" << std::endl;
+    output << "LOOKUP_TABLE default" << std::endl;
+    for (int i = 0; i < fluid_num; i++)
+        output << fp[i].density << std::endl;
+    output.close();
+}
+
+void writeFluidPressure(Sim *sim, const std::string &path, SimTime *time)
+{
+    int fluid_num = sim->parameter->fluid.number_total;
+    Fluid_Particle *fp = sim->fluid_particle;
+
+    std::fstream output;
+    output.open(path + "\\fluid_pressure-" + std::to_string(time->file_step) + ".vtk", std::ios::out);
+
+    output << "# vtk DataFile Version 2.0" << std::endl;
+    output << "scalar file" << std::endl;
+    output << "ASCII" << std::endl;
+    output << "DATASET POLYDATA" << std::endl;
+    output << "POINTS " << fluid_num << " float" << std::endl;
+    for (int i = 0; i < fluid_num; i++)
+        output << fp[i].position[0] << " " << fp[i].position[1] << " 0.0" << std::endl;
+    output << "POINT_DATA " << fluid_num << std::endl;
+    output << "SCALARS pressure float 1" << std::endl;
+    output << "LOOKUP_TABLE default" << std::endl;
+    for (int i = 0; i < fluid_num; i++)
+        output << fp[i].pressure << std::endl;
+    output.close();
+}
+
+void writeSolidVelocity(Sim *sim, const std::string &path, SimTime *time)
+{
+    int solid_num = sim->parameter->solid.number;
+    Solid_Particle *sp = sim->solid_particle;
+
+    std::fstream output;
+    output.open(path + "\\solid_velocity-" + std::to_string(time->file_step) + ".vtk", std::ios::out);
+
+    output << "# vtk DataFile Version 2.0" << std::endl;
+    output << "Velocity vector file" << std::endl;
+    output << "ASCII" << std::endl;
+    output << "DATASET POLYDATA" << std::endl;
+    output << "POINTS " << solid_num << " float" << std::endl;
+    for (int i = 0; i < solid_num; i++)
+        output << sp[i].position[0] << " " << sp[i].position[1] << " 0.0" << std::endl;
+    output << "POINT_DATA " << solid_num << std::endl;
+    output << "VECTORS velocity float " << std::endl;
+    for (int i = 0; i < solid_num; i++)
+        output << sp[i].velocity[0] << " " << sp[i].velocity[1] << " 0.0" << std::endl;
+    output.close();
+}
+
+void writeVirtVelocity(Sim *sim, const std::string &path, SimTime *time)
+{
+    int virt_num = sim->parameter->virt.number;
+    Virtual_Particle *vp = sim->virtual_particle;
+
+    std::fstream output;
+    output.open(path + "\\virtual_velocity-" + std::to_string(time->file_step) + ".vtk", std::ios::out);
+
+    output << "# vtk DataFile Version 2.0" << std::endl;
+    output << "Velocity vector file" << std::endl;
+    output << "ASCII" << std::endl;
+    output << "DATASET POLYDATA" << std::endl;
+    output << "POINTS " << virt_num << " float" << std::endl;
+    for (int i = 0; i < virt_num; i++)
+        output << vp[i].position[0] << " " << vp[i].position[1] << " 0.0" << std::endl;
+    output << "POINT_DATA " << virt_num << std::endl;
+    output << "VECTORS velocity float " << std::endl;
+    for (int i = 0; i < virt_num; i++)
+        output << vp[i].velocity[0] << " " << vp[i].velocity[1] << " 0.0" << std::endl;
+    output.close();
+}
+
+void writeVirtPressure(Sim *sim, const std::string &path, SimTime *time)
+{
+    int virt_num = sim->parameter->virt.number;
+    Virtual_Particle *vp = sim->virtual_particle;
+
+    std::fstream output;
+    output.open(path + "\\virtual_pressure-" + std::to_string(time->file_step) + ".vtk", std::ios::out);
+
+    output << "# vtk DataFile Version 2.0" << std::endl;
+    output << "scalar file" << std::endl;
+    output << "ASCII" << std::endl;
+    output << "DATASET POLYDATA" << std::endl;
+    output << "POINTS " << virt_num << " float" << std::endl;
+    for (int i = 0; i < virt_num; i++)
+        output << vp[i].position[0] << " " << vp[i].position[1] << " 0.0" << std::endl;
+    output << "POINT_DATA " << virt_num << std::endl;
+    output << "SCALARS pressure float 1" << std::endl;
+    output << "LOOKUP_TABLE default" << std::endl;
+    for (int i = 0; i < virt_num; i++)
+        output << vp[i].pressure << std::endl;
+    output.close();
+}
+
+void writeVirtDensity(Sim *sim, const std::string &path, SimTime *time)
+{
+    int virt_num = sim->parameter->virt.number;
+    Virtual_Particle *vp = sim->virtual_particle;
+
+    std::fstream output;
+    output.open(path + "\\virtual_density-" + std::to_string(time->file_step) + ".vtk", std::ios::out);
+
+    output << "# vtk DataFile Version 2.0" << std::endl;
+    output << "scalar file" << std::endl;
+    output << "ASCII" << std::endl;
+    output << "DATASET POLYDATA" << std::endl;
+    output << "POINTS " << virt_num << " float" << std::endl;
+    for (int i = 0; i < virt_num; i++)
+        output << vp[i].position[0] << " " << vp[i].position[1] << " 0.0" << std::endl;
+    output << "POINT_DATA " << virt_num << std::endl;
+    output << "SCALARS density float 1" << std::endl;
+    output << "LOOKUP_TABLE default" << std::endl;
+    for (int i = 0; i < virt_num; i++)
+        output << vp[i].density << std::endl;
+    output.close();
+}
+
+void writeData(Sim *sim, SimTime *time)
+{
+    Parameter *parameter = sim->parameter;
+    int fluid_num = parameter->fluid.number_total;
+    int solid_num = parameter->solid.number;
+    int virt_num = parameter->virt.number;
+
+    std::string file_path = "..\\out";
+    if (fluid_num != 0)
+    {
+        std::string fluid_file_path = file_path + "\\fluid";
+        CreateDirectory(fluid_file_path.c_str(), NULL);
+        writeFluidVelocity(sim, fluid_file_path, time);
+        writeFluidDensity(sim, fluid_file_path, time);
+        writeFluidPressure(sim, fluid_file_path, time);
+    }
+
+    if (solid_num != 0)
+    {
+        std::string solid_file_path = file_path + "\\solid";
+        CreateDirectory(solid_file_path.c_str(), NULL);
+        writeSolidVelocity(sim, solid_file_path, time);
+    }
+
+    if (virt_num != 0)
+    {
+        std::string virt_file_path = file_path + "\\virtual";
+        CreateDirectory(virt_file_path.c_str(), NULL);
+        writeVirtVelocity(sim, virt_file_path, time);
+        writeVirtDensity(sim, virt_file_path, time);
+        writeVirtPressure(sim, virt_file_path, time);
+    }
+}
+
+void outputData(Sim *sim, Sim *host_sim, SimTime *time)
+{
+    memoryCopyDevice2Host(sim, host_sim);
+
+    std::cout << "\n--saving results--" << std::endl;
+    std::cout << "time step=" << time->i << " t=" << time->current_time << std::endl;
+    std::cout << "file step=" << time->file_step << std::endl;
+
+    writeData(host_sim, time);
+}
+__global__ void print_info(Sim *sim)
+{
+    int n = 0;
+    Fluid_Particle *fp = sim->fluid_particle;
+    Solid_Particle *sp = sim->solid_particle;
+    Virtual_Particle *vp = sim->virtual_particle;
+    Block *block = sim->block;
+    int fluid_num = sim->parameter->fluid.number_total;
+
+    for (int i = 0; i < 64; i++)
+    {
+        printf("i=%d bid=%d\n", i, fp[0].pair_list[i].id);
+    }
+}
+
+void setupParameterConstant(Sim *sim, Sim *host_sim)
+{
+    // CudaConstant *cuda_constant = new CudaConstant;
+    // Parameter *parameter = host_sim->parameter;
+    // cuda_constant->copyFromPhysics(&(parameter->physics));
+    // cuda_constant->copyFromDomain(&(parameter->domain));
+    // cuda_constant->copyFromKernel(&(parameter->kernel));
+
+    // Sim *temp_sim = new Sim;
+    // CHECK(cudaMemcpy(temp_sim, sim, sizeof(Sim), cudaMemcpyDeviceToHost));
+    // cuda_constant->fluid_particle = temp_sim->fluid_particle;
+    // cuda_constant->solid_particle = temp_sim->solid_particle;
+    // cuda_constant->virtual_particle = temp_sim->virtual_particle;
+
+    CHECK(cudaMemcpyToSymbol(par, host_sim->parameter, sizeof(Parameter)));
+    // delete cuda_constant;
+}
+
+void mainCalculationLoop(Sim *sim, Sim *host_sim)
+{
+    printf("\n Calculation Start\n");
+
+    Parameter *parameter = host_sim->parameter;
+    SimTime *time = parameter->getTime();
+    clock_t start, end;
+    start = clock();
+
+    int fluid_num = parameter->fluid.number_total;
+    int solid_num = parameter->solid.number;
+
+    int error_flag = 0;
+
+    int thread_num = parameter->kernel.thread_num;
+
+    int virt_num = parameter->virt.number;
+    int particle_num = fluid_num + solid_num + virt_num;
+    int fluid_pair_size = parameter->kernel.fluid_pair_size;
+
+    int virt_data_size = 2 * sizeof(float) * fluid_pair_size;
+
+    setupParameterConstant(sim, host_sim);
+
+    fillParticlePair(sim, host_sim);
+    virtPhaseCalculate<<<virt_num, fluid_pair_size, virt_data_size>>>(sim, &error_flag);
+    cudaDeviceSynchronize();
+    outputData(sim, host_sim, time);
+    while (time->addStep())
+    {
+        if (!((time->i - 1) % 1))
+        {
+            fillParticlePair(sim, host_sim);
+        }
+
+        int fluid_data_size = sizeof(Eigen::Matrix2f) + sizeof(Eigen::Vector2f) + sizeof(float);
+        fluid_data_size = fluid_data_size * fluid_pair_size * 2;
+
+        virtPhaseCalculate<<<virt_num, fluid_pair_size, virt_data_size>>>(sim, &error_flag);
+        cudaDeviceSynchronize();
+
+        fluidDataCalculate_fast<<<fluid_num / thread_num + 1, thread_num>>>(sim, &error_flag);
+        cudaDeviceSynchronize();
+
+        // fluidDataCalculate<<<fluid_num, fluid_pair_size, fluid_data_size>>>(sim, &error_flag);
+        // cudaDeviceSynchronize();
+
+        fluidDataUpdate<<<fluid_num / thread_num + 1, thread_num>>>(sim, &error_flag);
+        cudaDeviceSynchronize();
+        if (time->isOutputData())
+        {
+            outputData(sim, host_sim, time);
+            end = clock();
+            printf("time=%dms\n", end - start);
+            start = clock();
+        }
+        // print_info<<<1, 1>>>(sim);
+        // cudaDeviceSynchronize();
+    }
+
+    end = clock();
+    printf("time=%dms\n", end - start);
+
+    print_info<<<1, 1>>>(sim);
+    cudaDeviceSynchronize();
+}

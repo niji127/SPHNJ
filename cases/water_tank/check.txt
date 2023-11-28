@@ -1,0 +1,5 @@
+top pressure
+beam viscosity 0.1 fluid 0.1
+normal calculation
+2d strain
+pos vel=0

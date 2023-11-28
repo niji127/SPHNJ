@@ -1,0 +1,10 @@
+^D:\SPH_SOFT\SPH_2D_GPU\SPHNJ\CASES\WATER_TANK\BUILD\CMAKEFILES\DBC1AE833280351D004F3E44C4E57146\GENERATE.STAMP.RULE
+setlocal
+D:\Code\Cmake\bin\cmake.exe -SD:/SPH_soft/SPH_2D_GPU/SPHNJ/cases/water_tank -BD:/SPH_soft/SPH_2D_GPU/SPHNJ/cases/water_tank/build --check-stamp-list CMakeFiles/generate.stamp.list --vs-solution-file D:/SPH_soft/SPH_2D_GPU/SPHNJ/cases/water_tank/build/water_tank.sln
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd

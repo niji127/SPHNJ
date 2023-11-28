@@ -1,0 +1,2 @@
+2d stress
+x<0 pos=0 vel=0

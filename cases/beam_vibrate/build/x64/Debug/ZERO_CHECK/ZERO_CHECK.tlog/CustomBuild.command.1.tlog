@@ -1,0 +1,10 @@
+^D:\SPH_SOFT\SPH_2D_GPU\SPHNJ\CASES\BEAM_VIBRATE\BUILD\CMAKEFILES\95ECF8F1D5A486DA3E16CF0B0FA91C94\GENERATE.STAMP.RULE
+setlocal
+D:\Code\Cmake\bin\cmake.exe -SD:/SPH_soft/SPH_2D_GPU/SPHNJ/cases/beam_vibrate -BD:/SPH_soft/SPH_2D_GPU/SPHNJ/cases/beam_vibrate/build --check-stamp-list CMakeFiles/generate.stamp.list --vs-solution-file D:/SPH_soft/SPH_2D_GPU/SPHNJ/cases/beam_vibrate/build/beam_vibrate.sln
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd

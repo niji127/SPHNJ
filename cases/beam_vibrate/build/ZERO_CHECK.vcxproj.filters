@@ -1,0 +1,13 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <CustomBuild Include="D:\SPH_soft\SPH_2D_GPU\SPHNJ\cases\beam_vibrate\build\CMakeFiles\95ecf8f1d5a486da3e16cf0b0fa91c94\generate.stamp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="CMake Rules">
+      <UniqueIdentifier>{EB88761D-E614-3183-AEF7-0FA7688BC4B7}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>
